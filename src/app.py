@@ -131,17 +131,27 @@ class Asset(BaseAsset):
 # ========================================
 # 3. CUSTOM ACTION OUTPUT
 # ========================================
-class DoppelActionOutput(ActionOutput):
-    status_code: int = OutputField(
-        example_values=[200, 404, 500], column_name="Status Code"
-    )
-    response_body: str = OutputField(
-        example_values=['{"id": "TST-900", "entity": "http://sample.com"}', "[]"],
-        column_name="Response Body (JSON)",
-    )
-    error_message: str = OutputField(
-        example_values=["", "Alert not found"], column_name="Error Message"
-    )
+class BaseAlertOutput(ActionOutput):
+    """Base DTO for Doppel Alerts"""
+    id: str | None = OutputField(description="Alert ID", example_values=["TST-123"], default=None)
+    entity: str | None = OutputField(description="Entity name", example_values=["example.com"], default=None)
+    severity: str | None = OutputField(description="Alert severity", example_values=["high", "medium"], default=None)
+    queue_state: str | None = OutputField(description="Current queue state", example_values=["doppel_review"], default=None)
+    entity_state: str | None = OutputField(description="Current entity state", example_values=["active", "takedown"], default=None)
+    doppel_link: str | None = OutputField(description="Link to Doppel dashboard", default=None)
+
+# Creating specific typed outputs for each action 
+class CreateAlertOutput(BaseAlertOutput):
+    pass
+
+class GetAlertOutput(BaseAlertOutput):
+    pass
+
+class GetAllAlertsOutput(BaseAlertOutput):
+    pass
+
+class UpdateAlertOutput(BaseAlertOutput):
+    pass
 
 
 # ========================================
@@ -152,7 +162,7 @@ app = App(
     app_type="generic",
     logo="logo.svg",
     logo_dark="logo_dark.svg",
-    product_vendor="Splunk Inc.",
+    product_vendor="Doppel",
     product_name="doppel",
     publisher="Doppel",
     appid="88e88f59-5c78-457b-9d81-1f41f9fd2096",
@@ -230,7 +240,6 @@ def _make_request(
 def test_connectivity(soar: SOARClient, asset: Asset) -> None:
     if not asset.doppel_api_key:
         logger.error("Doppel API key required")
-        raise ActionFailure("Doppel API key required")
     ok, status_code, data, error = _make_request(
         asset, "GET", "/alerts", params={"page_size": 1}
     )
@@ -244,233 +253,132 @@ def test_connectivity(soar: SOARClient, asset: Asset) -> None:
 # ========================================
 # 7. ACTIONS
 # ========================================
-@app.action()
+@app.action(
+    description="Create a new alert in Doppel for a specific entity.",
+    action_type="generic",
+    read_only=False,
+)
 def create_alert(
     params: CreateAlertParams, asset: Asset, soar: SOARClient
-) -> DoppelActionOutput:
+) -> CreateAlertOutput:
     logger.info("create_alert started")
-    if not asset.doppel_api_key:
-        logger.error("API key missing")
-        return DoppelActionOutput(
-            success=False,
-            message="API key missing",
-            status_code=0,
-            response_body="{}",
-            error_message="API key missing",
-        )
     payload = {"entity": params.entity}
     if params.brand:
         payload["brand"] = params.brand
     if params.source:
         payload["source"] = params.source
     ok, status_code, data, error = _make_request(asset, "POST", "/alert", data=payload)
-    response_body = json.dumps(data) if data else "[]"
-    if ok and (not data or (isinstance(data, list | dict) and len(data) == 0)):
-        logger.warning("Empty response from API")
-        return DoppelActionOutput(
-            success=False,
-            message="Failed to create alert: Empty response",
-            status_code=status_code,
-            response_body=response_body,
-            error_message="Empty response",
-        )
-    if ok:
-        logger.info(f"Alert created: {data.get('id')}")
-    else:
-        logger.error(f"Failed to create alert: {error}")
-    return DoppelActionOutput(
-        success=ok,
-        message=f"Created alert {data.get('id', 'unknown')}" if ok else error,
-        status_code=status_code,
-        response_body=response_body,
-        error_message="" if ok else error,
+    if not ok or not data:
+        raise ActionFailure(f"Failed to create alert. HTTP {status_code}: {error}")
+    logger.info(f"Alert created: {data.get('id')}")
+    # Map the dictionary to our strongly typed output model
+    return CreateAlertOutput(
+        id=data.get("id"),
+        entity=data.get("entity"),
+        severity=data.get("severity"),
+        queue_state=data.get("queue_state"),
+        entity_state=data.get("entity_state"),
+        doppel_link=data.get("doppel_link")
     )
 
 
-@app.action()
+@app.action(
+    description="Fetch details of a specific Doppel alert by its ID or entity.",
+    action_type="investigate",
+    read_only=True,
+)
 def get_alert(
     params: GetAlertParams, asset: Asset, soar: SOARClient
-) -> DoppelActionOutput:
+) -> GetAlertOutput:
     logger.info("get_alert started")
-    if not asset.doppel_api_key:
-        logger.error("API key missing")
-        return DoppelActionOutput(
-            success=False,
-            message="API key missing",
-            status_code=0,
-            response_body="{}",
-            error_message="API key missing",
-        )
     if (params.id and params.entity) or not (params.id or params.entity):
-        logger.error("Invalid parameters: Provide either id or entity")
-        return DoppelActionOutput(
-            success=False,
-            message="Provide either id or entity",
-            status_code=0,
-            response_body="{}",
-            error_message="Invalid parameters",
-        )
+        raise ActionFailure("Invalid parameters: Provide exactly one of 'id' or 'entity'")
 
-    query_params = {}
-    identifier = params.id or params.entity
-    if params.id:
-        query_params["id"] = params.id
-    elif params.entity:
-        query_params["entity"] = params.entity
+    query_params = params.model_dump(exclude_none=True)
+    ok, status_code, data, error = _make_request(asset, "GET", "/alert", params=query_params)
+    if not ok or not data:
+        identifier = params.id or params.entity
+        raise ActionFailure(f"No alert found for {identifier}. HTTP {status_code}: {error}")
 
-    ok, status_code, data, error = _make_request(
-        asset, "GET", "/alert", params=query_params
-    )
-    response_body = json.dumps(data) if data else "[]"
+    # Handle cases where searching by entity might return a list instead of a dict
+    alert_data = data[0] if isinstance(data, list) and len(data) > 0 else data
 
-    if ok:
-        if not data or (isinstance(data, list | dict) and len(data) == 0):
-            logger.warning(f"No alert found for {identifier}")
-            return DoppelActionOutput(
-                success=False,
-                message=f"No alert found for {identifier}",
-                status_code=status_code,
-                response_body=response_body,
-                error_message="No alert found",
-            )
-        logger.info(f"Alert found for {identifier}")
-        return DoppelActionOutput(
-            success=True,
-            message=f"Found alert for {identifier}",
-            status_code=status_code,
-            response_body=response_body,
-            error_message="",
-        )
-    logger.error(f"Failed to fetch alert for {identifier}: {error}")
-    return DoppelActionOutput(
-        success=False,
-        message=f"Failed to fetch alert for {identifier}: {error}",
-        status_code=status_code,
-        response_body=response_body,
-        error_message=error,
+    logger.info(f"Alert found: {alert_data.get('id')}")
+    return GetAlertOutput(
+        id=alert_data.get("id"),
+        entity=alert_data.get("entity"),
+        severity=alert_data.get("severity"),
+        queue_state=alert_data.get("queue_state"),
+        entity_state=alert_data.get("entity_state"),
+        doppel_link=alert_data.get("doppel_link")
     )
 
 
-@app.action()
+
+@app.action(
+    description="Retrieve multiple Doppel alerts based on search criteria and filters.",
+    action_type="investigate",
+    read_only=True,
+)
 def get_all_alerts(
     params: GetAllAlertsParams, asset: Asset, soar: SOARClient
-) -> DoppelActionOutput:
+) -> list[GetAllAlertsOutput]:
     logger.info("get_all_alerts started")
-    if not asset.doppel_api_key:
-        logger.error("API key missing")
-        return DoppelActionOutput(
-            success=False,
-            message="API key missing",
-            status_code=0,
-            response_body="{}",
-            error_message="API key missing",
-        )
-
-    query_params = {k: v for k, v in params.__dict__.items() if v is not None}
+    query_params = params.model_dump(exclude_none=True)
     ok, status_code, data, error = _make_request(
         asset, "GET", "/alerts", params=query_params
     )
-    response_body = json.dumps(data) if data else "[]"
+    if not ok:
+        raise ActionFailure(f"Failed to fetch alerts. HTTP {status_code}: {error}")
 
     alerts = data.get("alerts", []) if isinstance(data, dict) else []
-    if ok and not alerts:
-        logger.warning("No alerts found")
-        return DoppelActionOutput(
-            success=False,
-            message="No alerts found",
-            status_code=status_code,
-            response_body=response_body,
-            error_message="No alerts found",
-        )
-    if ok:
-        logger.info(f"Fetched {len(alerts)} alerts")
-    else:
-        logger.error(f"Failed to fetch alerts: {error}")
-    return DoppelActionOutput(
-        success=ok,
-        message=f"Fetched {len(alerts)} alerts" if ok else error,
-        status_code=status_code,
-        response_body=response_body,
-        error_message="" if ok else error,
-    )
+    logger.info(f"Fetched {len(alerts)} alerts")
+
+    # Build a list of typed outputs to return
+    results = []
+    for alert in alerts:
+        results.append(GetAllAlertsOutput(
+            id=alert.get("id"),
+            entity=alert.get("entity"),
+            severity=alert.get("severity"),
+            queue_state=alert.get("queue_state"),
+            entity_state=alert.get("entity_state"),
+            doppel_link=alert.get("doppel_link")
+        ))
+    return results
 
 
-@app.action()
+@app.action(
+    description="Update an existing Doppel alert's status, queue state, or tags.",
+    action_type="generic",
+    read_only=False,
+)
 def update_alert(
     params: UpdateAlertParams, asset: Asset, soar: SOARClient
-) -> DoppelActionOutput:
+) -> UpdateAlertOutput:
     logger.info("update_alert started")
-    if not asset.doppel_api_key:
-        logger.error("API key missing")
-        return DoppelActionOutput(
-            success=False,
-            message="API key missing",
-            status_code=0,
-            response_body="{}",
-            error_message="API key missing",
-        )
     if (params.id and params.entity) or not (params.id or params.entity):
-        logger.error("Invalid parameters: Provide either id or entity")
-        return DoppelActionOutput(
-            success=False,
-            message="Provide either id or entity",
-            status_code=0,
-            response_body="{}",
-            error_message="Invalid parameters",
-        )
+        raise ActionFailure("Invalid parameters: Provide exactly one of 'id' or 'entity'")
 
-    query_params = {}
     identifier = params.id or params.entity
-    if params.id:
-        query_params["id"] = params.id
-    elif params.entity:
-        query_params["entity"] = params.entity
-
-    payload = {
-        k: v
-        for k, v in params.__dict__.items()
-        if k not in ("id", "entity") and v is not None
-    }
+    query_params = {"id": params.id} if params.id else {"entity": params.entity}
+    # Exclude ID and Entity from the actual payload body being sent to update
+    payload = params.model_dump(exclude={"id", "entity"}, exclude_none=True)
     if not payload:
-        logger.error("No fields to update")
-        return DoppelActionOutput(
-            success=False,
-            message="No fields to update",
-            status_code=0,
-            response_body="{}",
-            error_message="No fields to update",
-        )
+        raise ActionFailure("No fields provided to update")
+    ok, status_code, data, error = _make_request(asset, "PUT", "/alert", params=query_params, data=payload)
 
-    ok, status_code, data, error = _make_request(
-        asset, "PUT", "/alert", params=query_params, data=payload
-    )
-    response_body = json.dumps(data) if data else "[]"
+    if not ok or not data:
+        raise ActionFailure(f"Failed to update alert for {identifier}. HTTP {status_code}: {error}")
 
-    if ok:
-        if not data or (isinstance(data, list | dict) and len(data) == 0):
-            logger.warning(f"No alert updated for {identifier}")
-            return DoppelActionOutput(
-                success=False,
-                message=f"No alert updated for {identifier}",
-                status_code=status_code,
-                response_body=response_body,
-                error_message="No alert updated",
-            )
-        logger.info(f"Alert updated for {identifier}")
-        return DoppelActionOutput(
-            success=True,
-            message=f"Updated alert for {identifier}",
-            status_code=status_code,
-            response_body=response_body,
-            error_message="",
-        )
-    logger.error(f"Failed to update alert for {identifier}: {error}")
-    return DoppelActionOutput(
-        success=False,
-        message=f"Failed to update alert for {identifier}: {error}",
-        status_code=status_code,
-        response_body=response_body,
-        error_message=error,
+    logger.info(f"Alert updated for {identifier}")
+    return UpdateAlertOutput(
+        id=data.get("id"),
+        entity=data.get("entity"),
+        severity=data.get("severity"),
+        queue_state=data.get("queue_state"),
+        entity_state=data.get("entity_state"),
+        doppel_link=data.get("doppel_link")
     )
 
 
@@ -613,26 +521,24 @@ def on_poll(
     params: OnPollParams, asset: Asset, soar: SOARClient
 ) -> Iterator[Container | Artifact]:
     logger.info("DOPPEL POLLING STARTED")
-    if not asset.doppel_api_key:
-        logger.error("API key missing")
-        return
 
     is_manual = soar.get_executing_container_id() == 0
-    if is_manual:
-        start_ts = (
-            datetime.now(ZoneInfo("UTC"))
-            - timedelta(days=asset.historical_polling_days)
-        ).strftime("%Y-%m-%dT%H:%M:%S")
-        logger.info(f"Manual Poll: Fetching since {start_ts}")
-        base_params = {"last_activity_timestamp": start_ts}
-    else:
-        start_ts = (datetime.now(ZoneInfo("UTC")) - timedelta(minutes=30)).strftime(
-            "%Y-%m-%dT%H:%M:%S"
-        )
-        logger.info(f"Scheduled Poll: Fetching since {start_ts}")
-        base_params = {"last_activity_timestamp": start_ts}
+    now_utc = datetime.now(ZoneInfo("UTC"))
+    state = soar.get_state() or {}
+    last_poll_time = state.get("last_poll_time")
 
-    base_params["page_size"] = 100
+    if is_manual or not last_poll_time:
+        # If manual, or if this is the very first scheduled run, use the historical days fallback
+        start_ts = (
+            now_utc - timedelta(days=asset.historical_polling_days)
+        ).strftime("%Y-%m-%dT%H:%M:%S")
+        logger.info(f"Manual/Initial Poll: Fetching since {start_ts}")
+    else:
+        # Standard scheduled run: pick up exactly where we left off
+        start_ts = last_poll_time
+        logger.info(f"Scheduled Poll: Fetching since {start_ts}")
+
+    base_params = {"last_activity_timestamp": start_ts, "page_size": 100}
     page = 0
     total_processed = 0
     containers_added = 0
@@ -705,13 +611,12 @@ def on_poll(
                 try:
                     yield container
                     containers_added += 1
-                    existing_container = get_existing_container(soar, unique_sdi)
-                    if existing_container:
-                        container_id = existing_container["id"]
+                    if container.container_id:
+                        container_id = container.container_id
                     else:
                         containers_failed += 1
                         logger.error(
-                            f"Failed to retrieve container for alert {alert_id}"
+                            f"Failed to retrieve container ID for alert {alert_id} after creation"
                         )
                         continue
                 except Exception as e:
@@ -871,6 +776,13 @@ def on_poll(
             "total_processed": total_processed,
         }
     )
+
+    # Save the start time of THIS run as the watermark for the NEXT run.
+    # We only save state for scheduled runs, not manual testing runs.
+    if not is_manual:
+        state["last_poll_time"] = now_utc.strftime("%Y-%m-%dT%H:%M:%S")
+        soar.save_state(state)
+        logger.info("Successfully saved state for next polling cycle.")
 
 
 # ========================================
